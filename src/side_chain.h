@@ -53,6 +53,7 @@ public:
 	void get_missing_blocks(std::vector<hash>& missing_blocks) const;
 
 	PoolBlock* find_block(const hash& id) const;
+	PoolBlock* get_block_unsafe(const hash& id);
 	void watch_mainchain_block(const ChainMain& data, const hash& possible_id);
 
 	bool get_block_blob(const hash& id, std::vector<uint8_t>& blob) const;
@@ -76,6 +77,9 @@ public:
 	bool is_mini() const;
 
 	const PoolBlock* chainTip() const { return m_chainTip; }
+
+	uint64_t tip_height() const;
+	hash tip_hash() const;
 
 	static bool split_reward(uint64_t reward, const std::vector<MinerShare>& shares, std::vector<uint64_t>& rewards);
 

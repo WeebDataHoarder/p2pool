@@ -32,13 +32,16 @@ public:
 		NETWORK,
 		POOL,
 		LOCAL,
+		SHARE,
+		BLOCK,
+		FAILED_BLOCK,
 	};
 
 	// cppcheck-suppress functionConst
 	void on_stop();
 
 	template<typename T>
-	void set(Category category, const char* filename, T&& callback) { dump_to_file_async_internal(category, filename, DumpFileCallback<T>(std::move(callback))); }
+	void set(Category category, const char* filename, T&& callback, size_t buf_size = 16384) { dump_to_file_async_internal(category, filename, DumpFileCallback<T>(std::move(callback)), buf_size); }
 
 private:
 	void create_dir(const std::string& path);
@@ -72,7 +75,7 @@ private:
 		T m_callback;
 	};
 
-	void dump_to_file_async_internal(Category category, const char* filename, DumpFileCallbackBase&& callback);
+	void dump_to_file_async_internal(Category category, const char* filename, DumpFileCallbackBase&& callback, size_t buf_size);
 	void dump_to_file();
 	static void on_fs_open(uv_fs_t* req);
 	static void on_fs_write(uv_fs_t* req);
@@ -82,6 +85,9 @@ private:
 	std::string m_networkPath;
 	std::string m_poolPath;
 	std::string m_localPath;
+	std::string m_sharePath;
+	std::string m_blocksPath;
+	std::string m_failedBlocksPath;
 
 	uv_mutex_t m_dumpDataLock;
 	unordered_map<std::string, std::vector<char>> m_dumpData;

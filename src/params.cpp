@@ -50,8 +50,34 @@ Params::Params(int argc, char* argv[])
 		}
 
 		if ((strcmp(argv[i], "--wallet") == 0) && (i + 1 < argc)) {
-			m_wallet.decode(argv[++i]);
+		    std::string w;
+		    const char* s = argv[++i];
+		    while (s) {
+		        const char c = *s;
+		        if (!c) {
+		            Wallet wallet(w.data());
+		            if(wallet.valid()){
+		                m_wallets.push_back(std::move(wallet));
+		            }
+		            w.clear();
+		            break;
+		        }
+		        if ((c == ',')) {
+		            Wallet wallet(w.data());
+		            if(wallet.valid()){
+		                m_wallets.push_back(std::move(wallet));
+		            }
+		            w.clear();
+		        }else{
+		            w += c;
+		        }
+		        ++s;
+		    }
 			ok = true;
+		}
+
+		if ((strcmp(argv[i], "--wallet-hr-overflow") == 0) && (i + 1 < argc)) {
+		    m_first_wallet_overflow_hashrate = static_cast<uint64_t>(atoi(argv[++i]));
 		}
 
 		if ((strcmp(argv[i], "--stratum") == 0) && (i + 1 < argc)) {
@@ -155,7 +181,7 @@ Params::Params(int argc, char* argv[])
 
 bool Params::ok() const
 {
-	return !m_host.empty() && m_rpcPort && m_zmqPort && m_wallet.valid();
+	return !m_host.empty() && m_rpcPort && m_zmqPort && !m_wallets.empty();
 }
 
 } // namespace p2pool

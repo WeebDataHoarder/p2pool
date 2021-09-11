@@ -59,8 +59,8 @@ p2pool::p2pool(int argc, char* argv[])
 {
 	LOGINFO(1, log::LightCyan() << VERSION);
 
-	if (!m_params->m_wallet.valid()) {
-		LOGERR(1, "Invalid wallet address. Try \"p2pool --help\".");
+	if (get_wallets().empty()) {
+		LOGERR(1, "Invalid wallet address(es). Try \"p2pool --help\".");
 		throw std::exception();
 	}
 
@@ -73,19 +73,26 @@ p2pool::p2pool(int argc, char* argv[])
 	hash pub, sec, eph_public_key;
 	generate_keys(pub, sec);
 
-	uint8_t view_tag;
-	if (!m_params->m_wallet.get_eph_public_key(sec, 0, eph_public_key, view_tag)) {
-		LOGERR(1, "Invalid wallet address: get_eph_public_key failed");
-		throw std::exception();
-	}
-
-	const NetworkType type = m_params->m_wallet.type();
+	const NetworkType type = get_current_wallet().type();
 
 	if (type == NetworkType::Testnet) {
-		LOGWARN(1, "Mining to a testnet wallet address");
+	    LOGWARN(1, "Mining to a testnet wallet address");
 	}
 	else if (type == NetworkType::Stagenet) {
-		LOGWARN(1, "Mining to a stagenet wallet address");
+	    LOGWARN(1, "Mining to a stagenet wallet address");
+	}
+
+	for(auto& w : get_wallets()){
+		uint8_t view_tag;
+	    if (!w.get_eph_public_key(sec, 0, eph_public_key, view_tag)) {
+	        LOGERR(1, "Invalid wallet address: get_eph_public_key failed");
+	        panic();
+	    }
+
+	    if(type != w.type()){
+	        LOGERR(1, "Invalid wallet address: type mismatch");
+	        panic();
+	    }
 	}
 
 	int err = uv_async_init(uv_default_loop_checked(), &m_submitBlockAsync, on_submit_block);
@@ -185,6 +192,80 @@ p2pool::~p2pool()
 	delete m_consoleCommands;
 }
 
+void p2pool::next_wallet(bool onlyCheck) const
+{
+    if(m_params->m_first_wallet_overflow_hashrate && get_wallets().size() > 1){
+        auto hr = get_wallet_hashrate(m_params->m_wallets.at(0));
+        if(hr < m_params->m_first_wallet_overflow_hashrate){
+            m_params->m_wallet_index = 0;
+        }else if (!onlyCheck){
+            m_params->m_wallet_index++;
+            //Wallet rotation
+            if(m_params->m_wallet_index >= get_wallets().size()){
+                m_params->m_wallet_index = 1;
+            }
+        }
+        return;
+    }
+
+    if(onlyCheck){
+        return;
+    }
+
+    m_params->m_wallet_index++;
+    //Wallet rotation
+    if(m_params->m_wallet_index >= get_wallets().size()){
+        m_params->m_wallet_index = 0;
+    }
+}
+
+uint64_t p2pool::get_wallet_hashrate(const Wallet& w) const{
+    auto hash = m_sideChain->tip_hash();
+    auto block = m_sideChain->get_block_unsafe(hash);
+    if(block){
+        auto b = *block;
+
+        struct hash eph_public_key;
+        uint64_t reward = 0;
+        uint64_t total_reward = 0;
+        for(auto it = b.m_outputs.begin(); it != b.m_outputs.end(); ++it){
+            auto index = std::distance(b.m_outputs.begin(), it);
+			uint8_t view_tag;
+            if (w.get_eph_public_key(b.m_txkeySec, index, eph_public_key, view_tag) && (it->m_ephPublicKey == eph_public_key)) {
+                reward += it->m_reward;
+            }
+            total_reward += it->m_reward;
+        }
+
+        uint64_t rem;
+        uint64_t pool_hashrate = udiv128(b.m_difficulty.hi, b.m_difficulty.lo, m_sideChain->block_time(), &rem);
+        uint64_t product[2];
+        product[0] = umul128(pool_hashrate, reward, &product[1]);
+        const uint64_t hashrate_est = total_reward ? udiv128(product[1], product[0], total_reward, &rem) : 0;
+
+        return hashrate_est;
+    }
+
+    return 0;
+}
+
+const Wallet& p2pool::get_current_wallet() const
+{
+    return get_wallets().at(m_params->m_wallet_index);
+}
+
+const std::vector<Wallet>& p2pool::get_wallets() const
+{
+    return m_params->m_wallets;
+}
+
+bool p2pool::is_wallet_ours(const Wallet& wallet) const
+{
+    return std::any_of(get_wallets().begin(), get_wallets().end(), [&wallet](const Wallet& w){
+        return w == wallet;
+    });
+}
+
 bool p2pool::calculate_hash(const void* data, size_t size, uint64_t height, const hash& seed, hash& result)
 {
 	return m_hasher->calculate(data, size, height, seed, result);
@@ -238,7 +319,7 @@ void p2pool::handle_tx(TxMempoolData& tx)
 		", fee = " << log::Gray() << static_cast<double>(tx.fee) / 1e6 << " um");
 
 #if TEST_MEMPOOL_PICKING_ALGORITHM
-	m_blockTemplate->update(miner_data(), *m_mempool, &m_params->m_wallet);
+	m_blockTemplate->update(miner_data(), *m_mempool, &get_current_wallet());
 #endif
 
 	m_zmqLastActive = seconds_since_epoch();
@@ -393,7 +474,10 @@ void p2pool::handle_chain_main(ChainMain& data, const char* extra)
 		PoolBlock* block = side_chain().find_block(sidechain_id);
 		if (block) {
 			LOGINFO(0, log::LightGreen() << "BLOCK FOUND: main chain block at height " << data.height << " was mined by this p2pool" << BLOCK_FOUND);
-			const uint64_t payout = block->get_payout(params().m_wallet);
+			uint64_t payout = 0;
+			for (auto& w : get_wallets()) {
+				payout += block->get_payout(w);
+			}
 			if (payout) {
 				LOGINFO(0, log::LightCyan() << "You received a payout of " << log::LightGreen() << log::XMRAmount(payout) << log::LightCyan() << " in block " << log::LightGreen() << data.height);
 			}
@@ -619,7 +703,8 @@ void p2pool::update_block_template()
 		m_hasher->set_seed_async(data.seed_hash);
 		m_updateSeed = false;
 	}
-	m_blockTemplate->update(data, *m_mempool, &m_params->m_wallet);
+	next_wallet(true);
+	m_blockTemplate->update(data, *m_mempool, &get_current_wallet());
 	stratum_on_block();
 	api_update_pool_stats();
 
@@ -1183,6 +1268,9 @@ void p2pool::api_update_pool_stats()
 	const uint64_t miners = std::max<uint64_t>(m_sideChain->miner_count(), m_p2pServer ? m_p2pServer->peer_list_size() : 0U);
 	const difficulty_type total_hashes = m_sideChain->total_hashes();
 
+	auto tip_hash = m_sideChain->tip_hash();
+	auto tip_height = m_sideChain->tip_height();
+
 	time_t last_block_found_time = 0;
 	uint64_t last_block_found_height = 0;
 	uint64_t total_blocks_found = 0;
@@ -1197,9 +1285,12 @@ void p2pool::api_update_pool_stats()
 	}
 
 	m_api->set(p2pool_api::Category::POOL, "stats",
-		[hashrate, miners, &total_hashes, last_block_found_time, last_block_found_height, total_blocks_found](log::Stream& s)
+		[hashrate, miners, &diff, &tip_hash, tip_height, &total_hashes, last_block_found_time, last_block_found_height, total_blocks_found](log::Stream& s)
 		{
 			s << "{\"pool_list\":[\"pplns\"],\"pool_statistics\":{\"hashRate\":" << hashrate
+				<< ",\"difficulty\":" << diff
+				<< ",\"hash\":\"" << tip_hash
+				<< "\",\"height\":" << tip_height
 				<< ",\"miners\":" << miners
 				<< ",\"totalHashes\":" << total_hashes
 				<< ",\"lastBlockFoundTime\":" << last_block_found_time
@@ -1352,6 +1443,461 @@ void p2pool::api_update_block_found(const ChainMain* data)
 		});
 
 	api_update_stats_mod();
+}
+
+
+    namespace base58 {
+#define SWAP64BE(x) ((((uint64_t) (x) & 0x00000000000000ff) << 56) | \
+(((uint64_t) (x) & 0x000000000000ff00) << 40) | \
+(((uint64_t) (x) & 0x0000000000ff0000) << 24) | \
+(((uint64_t) (x) & 0x00000000ff000000) <<  8) | \
+(((uint64_t) (x) & 0x000000ff00000000) >>  8) | \
+(((uint64_t) (x) & 0x0000ff0000000000) >> 24) | \
+(((uint64_t) (x) & 0x00ff000000000000) >> 40) | \
+(((uint64_t) (x) & 0xff00000000000000) >> 56))
+        namespace {
+            const char alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            const size_t alphabet_size = sizeof(alphabet) - 1;
+            const size_t encoded_block_sizes[] = {0, 2, 3, 5, 6, 7, 9, 10, 11};
+            const size_t full_block_size = sizeof(encoded_block_sizes) / sizeof(encoded_block_sizes[0]) - 1;
+            const size_t full_encoded_block_size = encoded_block_sizes[full_block_size];
+
+            uint64_t uint_8be_to_64(const uint8_t *data, size_t size) {
+                assert(1 <= size && size <= sizeof(uint64_t));
+
+                uint64_t res = 0;
+                memcpy(reinterpret_cast<uint8_t *>(&res) + sizeof(uint64_t) - size, data, size);
+                return SWAP64BE(res);
+            }
+
+            void encode_block(const uint8_t *block, size_t size, char *res) {
+                assert(1 <= size && size <= full_block_size);
+
+                uint64_t num = uint_8be_to_64(reinterpret_cast<const uint8_t *>(block), size);
+                int i = static_cast<int>(encoded_block_sizes[size]) - 1;
+                while (0 < num) {
+                    uint64_t remainder = num % alphabet_size;
+                    num /= alphabet_size;
+                    res[i] = alphabet[remainder];
+                    --i;
+                }
+            }
+        }
+
+        std::string encode(const std::vector<uint8_t> &data) {
+            if (data.empty())
+                return std::string();
+
+            size_t full_block_count = data.size() / full_block_size;
+            size_t last_block_size = data.size() % full_block_size;
+            size_t res_size = full_block_count * full_encoded_block_size + encoded_block_sizes[last_block_size];
+
+            std::string res(res_size, alphabet[0]);
+            for (size_t i = 0; i < full_block_count; ++i) {
+                encode_block(data.data() + i * full_block_size, full_block_size, &res[i * full_encoded_block_size]);
+            }
+
+            if (0 < last_block_size) {
+                encode_block(data.data() + full_block_count * full_block_size, last_block_size,
+                             &res[full_block_count * full_encoded_block_size]);
+            }
+
+            return res;
+        }
+    }
+
+
+    std::string get_address_from_wallet(Wallet &wallet) {
+        std::vector<uint8_t> data;
+        data.reserve(1 + 32 + 32);
+
+        switch (wallet.type()) {
+            case NetworkType::Invalid:
+                data.insert(data.end(), 0);
+                break;
+            case NetworkType::Mainnet:
+                data.insert(data.end(), 18);
+                break;
+            case NetworkType::Testnet:
+                data.insert(data.end(), 53);
+                break;
+            case NetworkType::Stagenet:
+                data.insert(data.end(), 24);
+                break;
+        }
+
+        data.insert(data.end(), std::begin(wallet.spend_public_key().h), std::end(wallet.spend_public_key().h));
+        data.insert(data.end(), std::begin(wallet.view_public_key().h), std::end(wallet.view_public_key().h));
+        uint8_t md[200];
+        keccak(data.data(), data.size(), md);
+
+        data.insert(data.end(), std::begin(md), std::begin(md) + NONCE_SIZE); //Insert checksum
+        return base58::encode(data);
+    }
+
+    hash get_mainchain_id_from_sidechain_block(PoolBlock& block){
+
+        std::vector<uint8_t> data;
+        data.push_back(block.m_majorVersion);
+        data.push_back(block.m_minorVersion);
+        writeVarint(block.m_timestamp, data);
+        data.insert(data.end(), block.m_prevId.h, block.m_prevId.h + HASH_SIZE);
+        data.insert(data.end(), reinterpret_cast<uint8_t*>(&block.m_nonce), reinterpret_cast<uint8_t*>(&block.m_nonce) + NONCE_SIZE);
+
+        std::vector<uint8_t> merkleTreeMainBranch;
+        std::vector<uint8_t> transactionHashes;
+        for(auto& txh : block.m_transactions){
+            transactionHashes.insert(transactionHashes.end(), txh.h, txh.h + HASH_SIZE);
+        }
+
+
+        const uint64_t count = block.m_transactions.size();
+        const uint8_t* h = transactionHashes.data();
+
+        hash root_hash;
+
+        if (count == 1) {
+            memcpy(root_hash.h, h, HASH_SIZE);
+        }
+        else if (count == 2) {
+            merkleTreeMainBranch.insert(merkleTreeMainBranch.end(), h + HASH_SIZE, h + HASH_SIZE * 2);
+            keccak(h, HASH_SIZE * 2, root_hash.h, HASH_SIZE);
+        }
+        else {
+            size_t i, j, cnt;
+
+            for (i = 0, cnt = 1; cnt <= count; ++i, cnt <<= 1) {}
+
+            cnt >>= 1;
+
+            std::vector<uint8_t> ints(cnt * HASH_SIZE);
+            memcpy(ints.data(), h, (cnt * 2 - count) * HASH_SIZE);
+
+            for (i = cnt * 2 - count, j = cnt * 2 - count; j < cnt; i += 2, ++j) {
+                if (i == 0) {
+                    merkleTreeMainBranch.insert(merkleTreeMainBranch.end(), h + HASH_SIZE, h + HASH_SIZE * 2);
+                }
+                keccak(h + i * HASH_SIZE, HASH_SIZE * 2, ints.data() + j * HASH_SIZE, HASH_SIZE);
+            }
+
+            while (cnt > 2) {
+                cnt >>= 1;
+                for (i = 0, j = 0; j < cnt; i += 2, ++j) {
+                    if (i == 0) {
+                        merkleTreeMainBranch.insert(merkleTreeMainBranch.end(), ints.data() + HASH_SIZE, ints.data() + HASH_SIZE * 2);
+                    }
+                    keccak(ints.data() + i * HASH_SIZE, HASH_SIZE * 2, ints.data() + j * HASH_SIZE, HASH_SIZE);
+                }
+            }
+
+            merkleTreeMainBranch.insert(merkleTreeMainBranch.end(), ints.data() + HASH_SIZE, ints.data() + HASH_SIZE * 2);
+            keccak(ints.data(), HASH_SIZE * 2, root_hash.h, HASH_SIZE);
+        }
+
+        data.insert(data.end(), root_hash.h, root_hash.h + HASH_SIZE);
+
+        writeVarint(block.m_transactions.size(), data);
+
+        std::vector<uint8_t> actualDataToHash;
+        actualDataToHash.reserve(data.size() + 10);
+        writeVarint(data.size(), actualDataToHash);
+        actualDataToHash.insert(actualDataToHash.end(), data.begin(), data.end());
+
+        hash mhash;
+        keccak(actualDataToHash.data(), actualDataToHash.size(), mhash.h, HASH_SIZE);
+
+        return mhash;
+    }
+
+
+unordered_map<std::string, std::string> p2pool::get_entries_from_block(PoolBlock& block, const MinerData& minerData) const{
+    unordered_map<std::string, std::string> shareData;
+    hash seed;
+    if (!get_seed(block.m_txinGenHeight, seed)) {
+        return {};
+    }
+
+    hash pow_hash;
+    if (!block.get_pow_hash(hasher(), block.m_txinGenHeight, seed, pow_hash)) {
+        return {};
+    }
+
+    shareData["version"] = "2";
+    shareData["height"] = std::to_string(block.m_sidechainHeight);
+
+    shareData["ts"] = std::to_string(block.m_timestamp);
+    shareData["lts"] = std::to_string(block.m_localTimestamp);
+
+    std::stringstream id;
+    id << block.m_sidechainId;
+    shareData["id"] = id.str();
+
+    std::stringstream prev_hash;
+    prev_hash << block.m_parent;
+    shareData["prev_id"] = prev_hash.str();
+
+    std::stringstream diff;
+    diff << std::hex << std::setfill('0') << std::setw(16) << block.m_difficulty.hi << std::setw(16) << block.m_difficulty.lo;
+    shareData["diff"] = diff.str();
+
+    std::stringstream tx_priv;
+    tx_priv << block.m_txkeySec;
+    shareData["coinbase_priv"] = tx_priv.str();
+
+    std::stringstream tx_coinbase;
+    tx_coinbase << block.m_transactions.at(0);
+    shareData["coinbase_id"] = tx_coinbase.str();
+
+
+    uint64_t coinbase_reward = 0;
+    for(auto& o : block.m_outputs){
+        coinbase_reward += o.m_reward;
+    }
+    shareData["coinbase_reward"] = std::to_string(coinbase_reward);
+
+
+
+    shareData["main_height"] = std::to_string(block.m_txinGenHeight);
+    std::stringstream main_block_id;
+    auto main_id = get_mainchain_id_from_sidechain_block(block);
+    main_block_id << main_id;
+    shareData["main_id"] = main_block_id.str();
+
+
+    std::stringstream pow;
+    pow << pow_hash;
+    shareData["pow_hash"] = pow.str();
+
+    std::stringstream miner_main_id;
+    miner_main_id << block.m_prevId;
+    shareData["miner_main_id"] = miner_main_id.str();
+
+    if(block.m_prevId == minerData.prev_id){
+
+        std::stringstream miner_diff;
+        miner_diff << std::hex << std::setfill('0') << std::setw(16) << minerData.difficulty.hi;
+        miner_diff << std::setw(16) << minerData.difficulty.lo;
+        shareData["miner_main_diff"] = miner_diff.str();
+
+        if(minerData.difficulty.check_pow(pow_hash)){
+            shareData["main_found"] = "true";
+        }
+    }else if (m_mainchainByHeight.find(block.m_txinGenHeight + 1) != m_mainchainByHeight.end()){ // Find next block from us to grab difficulty from them, if able
+        auto& main_block = m_mainchainByHeight.find(block.m_txinGenHeight + 1)->second;
+
+        std::stringstream miner_diff;
+        miner_diff << std::hex << std::setfill('0') << std::setw(16) << main_block.difficulty.hi;
+        miner_diff << std::setw(16) << main_block.difficulty.lo;
+        shareData["miner_main_diff"] = miner_diff.str();
+    }else{
+        if (main_id == minerData.prev_id){ // This is a found block that went some weird path?
+            shareData["main_found"] = "true";
+        }
+
+        difficulty_type bogus_diff;
+        bogus_diff.hi = 0xFFFFFFFFFFFFFFFF;
+        bogus_diff.lo = 0xFFFFFFFFFFFFFFFF;
+        std::stringstream miner_diff;
+        miner_diff << std::hex << std::setfill('0') << std::setw(16) << bogus_diff.hi;
+        miner_diff << std::setw(16) << bogus_diff.lo;
+        shareData["miner_main_diff"] = miner_diff.str();
+    }
+
+    shareData["wallet"] = get_address_from_wallet(block.m_minerWallet);
+
+    return shareData;
+}
+
+void p2pool::api_update_sidechain_new_block_on_chain(const PoolBlock* block, bool force_found)
+{
+    if (!m_api || block == nullptr) {
+        return;
+    }
+
+    auto minerData = miner_data();
+
+    std::vector<uint8_t> buf = block->m_mainChainData;
+    buf.insert(buf.end(), block->m_sideChainData.begin(), block->m_sideChainData.end());
+
+    PoolBlock dBlock;
+    dBlock.deserialize(buf.data(), buf.size(), *m_sideChain);
+
+    auto blockData = get_entries_from_block(dBlock, minerData);
+    if(force_found){
+        blockData["block_found"] = "true";
+    }
+
+    std::vector<unordered_map<std::string, std::string>> uncles;
+
+    for(auto& u : block->m_uncles){
+        auto uncle_block = side_chain().get_block_unsafe(u);
+
+        if(uncle_block){
+            buf.clear();
+            buf.insert(buf.end(), uncle_block->m_mainChainData.begin(), uncle_block->m_mainChainData.end());
+            buf.insert(buf.end(), uncle_block->m_sideChainData.begin(), uncle_block->m_sideChainData.end());
+            PoolBlock uBlock;
+            uBlock.deserialize(buf.data(), buf.size(), *m_sideChain);
+
+            uncles.emplace_back(get_entries_from_block(uBlock, minerData));
+        }else{
+            std::stringstream u_id;
+            u_id << u;
+            uncles.push_back({{"version", "2"}, {"id", u_id.str()}});
+        }
+    }
+
+    auto fname = std::to_string(block->m_sidechainHeight);
+    m_api->set(p2pool_api::Category::SHARE, fname.data(),
+               [&blockData, &uncles](log::Stream& s)
+               {
+        s << "{\n";
+        bool first = true;
+        for (auto it = blockData.begin(); it != blockData.end(); ++it) {
+            if (!first) {
+                s << ",\n";
+            }
+            s << "\"" + it->first + "\": \"" + it->second + "\"";
+            first = false;
+        }
+        if(!uncles.empty()){
+            s << ",\n\"uncles\": [\n";
+            first = true;
+            for(auto& uncle : uncles){
+                if (!first) {
+                    s << ",\n";
+                }
+
+                s << "{\n";
+                bool ufirst = true;
+                for (auto it = uncle.begin(); it != uncle.end(); ++it) {
+                    if (!ufirst) {
+                        s << ",\n";
+                    }
+                    s << "\"" + it->first + "\": \"" + it->second + "\"";
+                    ufirst = false;
+                }
+                s << "\n}";
+
+                first = false;
+            }
+            s << "\n]";
+        }
+        s << "\n}";
+               });
+}
+
+
+std::pair<std::string, std::string> p2pool::get_hex_block_serialization(PoolBlock& block){
+    std::stringstream res;
+    res << std::hex << std::setfill('0');
+
+    std::vector<uint8_t> buf = block.m_mainChainData;
+    buf.insert(buf.end(), block.m_sideChainData.begin(), block.m_sideChainData.end());
+
+    PoolBlock dBlock;
+    const int result = dBlock.deserialize(buf.data(), buf.size(), *m_sideChain);
+
+    if(result != 0){
+        return {"", ""};
+    }
+
+    hash seed;
+    if (!get_seed(dBlock.m_txinGenHeight, seed)) {
+        return {};
+    }
+
+    hash pow_hash;
+    if (!dBlock.get_pow_hash(hasher(), dBlock.m_txinGenHeight, seed, pow_hash)) {
+        return {};
+    }
+
+    hash main_id = get_mainchain_id_from_sidechain_block(dBlock);
+
+    res << std::setw(sizeof(uint64_t) * 2) << (uint64_t) 1; //Version 1
+
+    for(auto& e : main_id.h){ // HASH_SIZE
+        res << std::setw(2) << static_cast<unsigned>(e);
+    }
+    for(auto& e : pow_hash.h){ // HASH_SIZE
+        res << std::setw(2) << static_cast<unsigned>(e);
+    }
+
+    auto minerData = miner_data();
+    if(dBlock.m_prevId == minerData.prev_id){
+        res << std::setw(sizeof(uint64_t) * 2) << minerData.difficulty.hi;
+        res << std::setw(sizeof(uint64_t) * 2) << minerData.difficulty.lo;
+    }else if (m_mainchainByHeight.find(dBlock.m_txinGenHeight + 1) != m_mainchainByHeight.end()){ // Find next block from us to grab difficulty from them, if able
+        auto& main_block = m_mainchainByHeight.find(dBlock.m_txinGenHeight + 1)->second;
+
+        res << std::setw(sizeof(uint64_t) * 2) << main_block.difficulty.hi;
+        res << std::setw(sizeof(uint64_t) * 2) << main_block.difficulty.lo;
+    }else{
+        difficulty_type bogus_diff;
+        bogus_diff.hi = 0xFFFFFFFFFFFFFFFF;
+        bogus_diff.lo = 0xFFFFFFFFFFFFFFFF;
+        res << std::setw(sizeof(uint64_t) * 2) << bogus_diff.hi;
+        res << std::setw(sizeof(uint64_t) * 2) << bogus_diff.lo;
+    }
+
+    res << std::setw(sizeof(uint64_t) * 2) << (uint64_t)dBlock.m_mainChainData.size();
+    for(auto& e : dBlock.m_mainChainData){
+        res << std::setw(2) << static_cast<unsigned>(e);
+    }
+
+    res << std::setw(sizeof(uint64_t) * 2) << (uint64_t)dBlock.m_sideChainData.size();
+    for(auto& e : dBlock.m_sideChainData){
+        res << std::setw(2) << static_cast<unsigned>(e);
+    }
+
+    std::stringstream id;
+    id << dBlock.m_sidechainId;
+    return {id.str(), res.str()};
+}
+
+void p2pool::api_update_sidechain_new_block(PoolBlock* block)
+{
+    if (!m_api || block == nullptr) {
+        return;
+    }
+
+    auto h = get_hex_block_serialization(*block);
+    if(h.first.empty() || h.second.empty()){
+        return;
+    }
+
+    auto fname = h.first;
+    auto fdata = h.second;
+    m_api->set(p2pool_api::Category::BLOCK, fname.data(), [&fdata](log::Stream& s){
+        s << fdata;
+    }, fdata.size() + 1024);
+}
+
+
+void p2pool::api_update_sidechain_failed_block(PoolBlock* block, const std::string& peer)
+{
+    if (!m_api || block == nullptr) {
+        return;
+    }
+
+    auto h = get_hex_block_serialization(*block);
+    if(h.first.empty() || h.second.empty()){
+        return;
+    }
+
+    std::stringstream s;
+    s << std::hex << std::setfill('0');
+    s << std::setw(sizeof(uint64_t) * 2) << (uint64_t) peer.size();
+    for(auto& c : peer){ // add peer address
+        s << std::setw(2) << static_cast<unsigned>(c);
+    }
+
+
+    auto fname = h.first;
+    auto fdata = h.second + s.str();
+    m_api->set(p2pool_api::Category::FAILED_BLOCK, fname.data(), [&fdata](log::Stream& s){
+        s << fdata;
+    }, fdata.size() + 1024);
 }
 
 bool p2pool::get_difficulty_at_height(uint64_t height, difficulty_type& diff)

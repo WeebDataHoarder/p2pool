@@ -2047,6 +2047,8 @@ void P2PServer::P2PClient::handle_incoming_block(p2pool* pool, PoolBlock& block,
 			LOGWARN(3, "IP " << addr_hex << " banned for " << DEFAULT_BAN_TIME << " seconds");
 		}
 
+		pool->api_update_sidechain_failed_block(&block, std::string(m_addrString));
+
 		P2PServer* server = pool->p2p_server();
 		server->ban(addr, DEFAULT_BAN_TIME);
 		server->remove_peer_from_list(addr);

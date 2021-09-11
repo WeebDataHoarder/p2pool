@@ -33,6 +33,8 @@ class Miner;
 class ConsoleCommands;
 class p2pool_api;
 class ZMQReader;
+class Wallet;
+struct PoolBlock;
 
 class p2pool : public MinerCallbackHandler
 {
@@ -46,6 +48,11 @@ public:
 	void stop();
 
 	const Params& params() const { return *m_params; }
+	void next_wallet(bool onlyCheck = false) const;
+	uint64_t get_wallet_hashrate(const Wallet& w) const;
+	const Wallet& get_current_wallet() const;
+	const std::vector<Wallet>& get_wallets() const;
+	bool is_wallet_ours(const Wallet& w) const;
 	BlockTemplate& block_template() { return *m_blockTemplate; }
 	SideChain& side_chain() { return *m_sideChain; }
 
@@ -85,6 +92,9 @@ public:
 	bool chainmain_get_by_hash(const hash& id, ChainMain& data) const;
 
 	void api_update_block_found(const ChainMain* data);
+	void api_update_sidechain_new_block_on_chain(const PoolBlock* block, bool force_found = false);
+	void api_update_sidechain_new_block(PoolBlock* block);
+	void api_update_sidechain_failed_block(PoolBlock* block, const std::string& peer);
 
 	bool get_difficulty_at_height(uint64_t height, difficulty_type& diff);
 
@@ -144,6 +154,10 @@ private:
 
 	bool parse_block_header(const char* data, size_t size, ChainMain& result);
 	uint32_t parse_block_headers_range(const char* data, size_t size);
+
+
+	unordered_map<std::string, std::string> get_entries_from_block(PoolBlock& block, const MinerData& minerData) const;
+	std::pair<std::string, std::string> get_hex_block_serialization(PoolBlock& block);
 
 	void api_update_network_stats();
 	void api_update_pool_stats();

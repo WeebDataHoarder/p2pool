@@ -565,8 +565,12 @@ bool SideChain::add_external_block(PoolBlock& block, std::vector<hash>& missing_
 			m_watchBlockSidechainId = {};
 			data = m_watchBlock;
 			block_found = true;
+            m_pool->api_update_sidechain_new_block_on_chain(&block, true);
 
-			const uint64_t payout = block.get_payout(m_pool->params().m_wallet);
+			uint64_t payout = 0;
+			for (auto& w : m_pool->get_wallets()) {
+				payout += block.get_payout(w);
+			}
 			if (payout) {
 				LOGINFO(0, log::LightCyan() << "You received a payout of " << log::LightGreen() << log::XMRAmount(payout) << log::LightCyan() << " in block " << log::LightGreen() << data.height);
 			}
@@ -628,6 +632,8 @@ void SideChain::add_block(const PoolBlock& block)
 	else {
 		verify_loop(new_block);
 	}
+
+	m_pool->api_update_sidechain_new_block(new_block);
 }
 
 PoolBlock* SideChain::find_block(const hash& id) const
@@ -640,6 +646,12 @@ PoolBlock* SideChain::find_block(const hash& id) const
 	}
 
 	return nullptr;
+}
+
+PoolBlock* SideChain::get_block_unsafe(const hash& id)
+{
+    auto it = m_blocksById.find(id);
+    return it != m_blocksById.end() ? it->second : nullptr;
 }
 
 void SideChain::watch_mainchain_block(const ChainMain& data, const hash& possible_id)
@@ -782,7 +794,7 @@ void SideChain::print_status() const
 		blocks_in_window.emplace_back(cur->m_sidechainId);
 		++total_blocks_in_window;
 
-		if (cur->m_minerWallet == m_pool->params().m_wallet) {
+		if (m_pool->is_wallet_ours(cur->m_minerWallet)) {
 			// this produces an integer division with quotient rounded up, avoids non-whole divisions from overflowing on total_blocks_in_window
 			const size_t window_index = (total_blocks_in_window - 1) / ((m_chainWindowSize + our_blocks_in_window.size() - 1) / our_blocks_in_window.size());
 			our_blocks_in_window[std::min(window_index, our_blocks_in_window.size() - 1)]++; // clamp window_index, even if total_blocks_in_window is not larger than m_chainWindowSize
@@ -800,7 +812,7 @@ void SideChain::print_status() const
 				PoolBlock* uncle = it->second;
 				if (tip_height - uncle->m_sidechainHeight < m_chainWindowSize) {
 					++total_uncles_in_window;
-					if (uncle->m_minerWallet == m_pool->params().m_wallet) {
+					if (m_pool->is_wallet_ours(uncle->m_minerWallet)) {
 						// this produces an integer division with quotient rounded up, avoids non-whole divisions from overflowing on total_blocks_in_window
 						const size_t window_index = (total_blocks_in_window - 1) / ((m_chainWindowSize + our_uncles_in_window.size() - 1) / our_uncles_in_window.size());
 						our_uncles_in_window[std::min(window_index, our_uncles_in_window.size() - 1)]++; // clamp window_index, even if total_blocks_in_window is not larger than m_chainWindowSize
@@ -829,28 +841,30 @@ void SideChain::print_status() const
 				if (!std::binary_search(blocks_in_window.begin(), blocks_in_window.end(), block->m_sidechainId)) {
 					LOGINFO(4, "orphan block at height " << log::Gray() << block->m_sidechainHeight << log::NoColor() << ": " << log::Gray() << block->m_sidechainId);
 					++total_orphans;
-					if (block->m_minerWallet == m_pool->params().m_wallet) {
+					if (m_pool->is_wallet_ours(block->m_minerWallet)) {
 						++our_orphans;
 					}
 				}
 			}
 		}
 
-		const Wallet& w = m_pool->params().m_wallet;
+		const PoolBlock* tip = m_chainTip;
+		const std::vector<PoolBlock::TxOutput>& outs = tip->m_outputs;
 
 		hash eph_public_key;
-		for (size_t i = 0, n = tip->m_outputs.size(); i < n; ++i) {
+		for (size_t i = 0, n = outs.size(); i < n; ++i) {
 			const PoolBlock::TxOutput& out = tip->m_outputs[i];
-			if (!your_reward) {
-				if (out.m_txType == TXOUT_TO_TAGGED_KEY) {
+			if (out.m_txType == TXOUT_TO_TAGGED_KEY) {
+				for(auto& w : m_pool->get_wallets()){
 					if (w.get_eph_public_key_with_view_tag(tip->m_txkeySec, i, eph_public_key, out.m_viewTag) && (out.m_ephPublicKey == eph_public_key)) {
 						your_reward = out.m_reward;
 					}
 				}
-				else {
-					uint8_t view_tag;
+			} else {
+				uint8_t view_tag;
+				for(auto& w : m_pool->get_wallets()){
 					if (w.get_eph_public_key(tip->m_txkeySec, i, eph_public_key, view_tag) && (out.m_ephPublicKey == eph_public_key)) {
-						your_reward = out.m_reward;
+						your_reward += outs[i].m_reward;
 					}
 				}
 			}
@@ -969,6 +983,18 @@ uint64_t SideChain::last_updated() const
 bool SideChain::is_default() const
 {
 	return (memcmp(m_consensusId.data(), default_consensus_id, HASH_SIZE) == 0);
+}
+
+uint64_t SideChain::tip_height() const
+{
+	const PoolBlock* tip = m_chainTip;
+	return tip != nullptr ? tip->m_sidechainHeight : 0;
+}
+
+hash SideChain::tip_hash() const
+{
+	const PoolBlock* tip = m_chainTip;
+	return tip != nullptr ? tip->m_sidechainId : hash{};
 }
 
 bool SideChain::is_mini() const
@@ -1528,6 +1554,7 @@ void SideChain::update_chain_tip(const PoolBlock* block)
 	if (is_longer_chain(tip, block, is_alternative)) {
 		difficulty_type diff;
 		if (get_difficulty(block, m_difficultyData, diff)) {
+			const PoolBlock* t = m_chainTip;
 			m_chainTip = const_cast<PoolBlock*>(block);
 			{
 				WriteLock lock(m_curDifficultyLock);
@@ -1541,6 +1568,15 @@ void SideChain::update_chain_tip(const PoolBlock* block)
 			block->m_wantBroadcast = true;
 			if (m_pool) {
 				m_pool->update_block_template_async(is_alternative);
+
+				auto b = block;
+				do{
+					m_pool->api_update_sidechain_new_block_on_chain(b);
+					b = get_parent(b);
+					while (t != nullptr && b != nullptr && t->m_sidechainHeight > b->m_sidechainHeight){
+						t = get_parent(t);
+					}
+				} while (b != nullptr && (t == nullptr || t->m_sidechainId != b->m_sidechainId));
 
 				// Reset stratum share counters when switching to an alternative chain to avoid confusion
 				if (is_alternative) {

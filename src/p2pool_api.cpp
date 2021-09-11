@@ -60,6 +60,9 @@ p2pool_api::p2pool_api(const std::string& api_path, const bool local_stats): m_a
 
 	m_networkPath = m_apiPath + "network/";
 	m_poolPath = m_apiPath + "pool/";
+	m_sharePath = m_apiPath + "share/";
+	m_blocksPath = m_apiPath + "blocks/";
+	m_failedBlocksPath = m_apiPath + "failed_blocks/";
 	m_localPath = m_apiPath + "local/";
 
 	create_dir(m_networkPath);
@@ -67,6 +70,19 @@ p2pool_api::p2pool_api(const std::string& api_path, const bool local_stats): m_a
 
 	if (local_stats) {
 		create_dir(m_localPath);
+	}
+
+	create_dir(m_sharePath);
+	for(auto& c : "0123456789"){
+	    create_dir(m_sharePath + c + "/");
+	}
+	create_dir(m_blocksPath);
+	for(auto& c : "0123456789abcdef"){
+	    create_dir(m_blocksPath + c + "/");
+	}
+	create_dir(m_failedBlocksPath);
+	for(auto& c : "0123456789abcdef"){
+		create_dir(m_failedBlocksPath + c + "/");
 	}
 }
 
@@ -101,9 +117,9 @@ void p2pool_api::on_stop()
 	uv_close(reinterpret_cast<uv_handle_t*>(&m_dumpToFileAsync), nullptr);
 }
 
-void p2pool_api::dump_to_file_async_internal(Category category, const char* filename, DumpFileCallbackBase&& callback)
+void p2pool_api::dump_to_file_async_internal(Category category, const char* filename, DumpFileCallbackBase&& callback, size_t buf_size)
 {
-	std::vector<char> buf(16384);
+	std::vector<char> buf(buf_size);
 	log::Stream s(buf.data(), buf.size());
 	callback(s);
 	buf.resize(s.m_pos);
@@ -115,6 +131,9 @@ void p2pool_api::dump_to_file_async_internal(Category category, const char* file
 	case Category::NETWORK: path = m_networkPath + filename; break;
 	case Category::POOL:    path = m_poolPath    + filename; break;
 	case Category::LOCAL:   path = m_localPath   + filename; break;
+	case Category::SHARE:   path = m_sharePath   + filename[strlen(filename) - 1] + "/" + filename; break;
+	case Category::BLOCK:   path = m_blocksPath  + filename[0] + "/" + filename; break;
+	case Category::FAILED_BLOCK: path = m_failedBlocksPath  + filename[0] + "/" + filename; break;
 	}
 
 	{

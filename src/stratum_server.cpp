@@ -854,6 +854,7 @@ void StratumServer::on_share_found(uv_work_t* req)
 		const char* s = client->m_customUser;
 		LOGINFO(0, log::Green() << "SHARE FOUND: mainchain height " << height << ", diff " << sidechain_difficulty << ", client " << static_cast<char*>(client->m_addrString) << (*s ? " user " : "") << s << ", effort " << effort << '%');
 		pool->submit_sidechain_block(share->m_templateId, share->m_nonce, share->m_extraNonce);
+		pool->next_wallet();
 	}
 
 	// Send the response to miner

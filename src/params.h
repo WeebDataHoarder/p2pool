@@ -31,7 +31,9 @@ struct Params
 	uint32_t m_rpcPort = 18081;
 	uint32_t m_zmqPort = 18083;
 	bool m_lightMode = false;
-	Wallet m_wallet{ nullptr };
+	std::vector<Wallet> m_wallets;
+	uint32_t m_wallet_index = 0;
+	uint64_t m_first_wallet_overflow_hashrate = 0;
 	std::string m_stratumAddresses;
 	std::string m_p2pAddresses;
 	std::string m_p2pPeerList;

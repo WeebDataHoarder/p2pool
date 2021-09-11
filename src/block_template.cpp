@@ -171,7 +171,7 @@ static FORCEINLINE uint64_t get_block_reward(uint64_t base_reward, uint64_t medi
 	return reward + fees;
 }
 
-void BlockTemplate::update(const MinerData& data, const Mempool& mempool, Wallet* miner_wallet)
+void BlockTemplate::update(const MinerData& data, const Mempool& mempool, const Wallet* miner_wallet)
 {
 	if (data.major_version > HARDFORK_SUPPORTED_VERSION) {
 		LOGERR(1, "got hardfork version " << data.major_version << ", expected <= " << HARDFORK_SUPPORTED_VERSION);
